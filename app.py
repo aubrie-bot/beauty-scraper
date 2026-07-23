@@ -1,22 +1,18 @@
+import time
 import html
 import logging
-import re
-import time
-from collections import Counter
-from typing import List, Dict, Any, Optional
-from urllib.parse import quote, urlparse
 
 import pandas as pd
-import requests
 import streamlit as st
-from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
+from utils import (
+    SUBREDDITS,
+    get_reddit_search_url,
+    is_safe_url,
+    run_analysis,
+    sanitize_text,
+)
 
-# ---------------------------
-# 基本設定
-# ---------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -26,623 +22,277 @@ st.set_page_config(
     layout="wide",
 )
 
-SUBREDDITS = [
-    "MakeupAddiction",
-    "SkincareAddiction",
-    "drugstoreMUA",
-    "BeautyGuruChatter",
-    "AsianBeauty",
-]
+CACHE_TTL_SECONDS = 3600
+SESSION_RATE_LIMIT_SECONDS = 180
 
-REDLIB_INSTANCES = [
-    "https://redlib.tux.pizza",
-    "https://redlib.seasi.dev",
-    "https://redlib.catsarch.com",
-    "https://redlib.freedit.eu",
-    "https://red.ngn.tf",
-]
-
-SEARCH_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-ALLOWED_SCHEMES = {"http", "https"}
-ALLOWED_DOMAINS = {
-    "reddit.com",
-    "www.reddit.com",
-    "old.reddit.com",
-    "redlib.tux.pizza",
-    "redlib.seasi.dev",
-    "redlib.catsarch.com",
-    "redlib.freedit.eu",
-    "red.ngn.tf",
-    "www.google.com",
-    "lite.duckduckgo.com",
-}
-
-REQUEST_TIMEOUT = 12
-CACHE_TTL_SECONDS = 60 * 60
-SESSION_RATE_LIMIT_SECONDS = 300
-MAX_POSTS_PER_SOURCE = 20
-MAX_TOP_POSTS_PER_BRAND = 3
-SEARCH_DELAY_SECONDS = 1.0
-
-KNOWN_BRANDS = [
-    "Rare Beauty", "Fenty Beauty", "NARS", "Charlotte Tilbury", "MAC",
-    "Urban Decay", "Too Faced", "Tarte", "Benefit", "Clinique",
-    "Estee Lauder", "Lancome", "Maybelline", "L'Oreal", "Revlon",
-    "NYX", "e.l.f.", "Elf", "CeraVe", "The Ordinary", "Paula's Choice",
-    "Drunk Elephant", "Tatcha", "Glossier", "Tower 28", "Kosas",
-    "Patrick Ta", "Makeup by Mario", "Natasha Denona",
-    "Huda Beauty", "Anastasia Beverly Hills", "ABH", "Morphe",
-    "Laura Mercier", "Bobbi Brown", "Dior", "Chanel", "YSL",
-    "Tom Ford", "Hourglass", "Colourpop", "ColourPop",
-    "IT Cosmetics", "Mario Badescu", "First Aid Beauty", "Fresh",
-    "Laneige", "Innisfree", "COSRX",
-]
-
-PRODUCT_KEYWORDS = [
-    "blush", "foundation", "concealer", "mascara", "lipstick", "lip gloss",
-    "eyeshadow", "palette", "serum", "moisturizer", "cleanser", "sunscreen",
-    "SPF", "retinol", "vitamin c", "niacinamide", "hyaluronic",
-    "toner", "exfoliant", "primer", "setting spray", "setting powder",
-    "bronzer", "highlighter", "cream", "lotion", "oil", "mask",
-    "holy grail", "HG", "favorite", "recommend", "must have", "best of",
-]
-
-
-# ---------------------------
-# 安全與工具函式
-# ---------------------------
-def create_session() -> requests.Session:
-    session = requests.Session()
-
-    retry = Retry(
-        total=2,
-        read=2,
-        connect=2,
-        backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(SEARCH_HEADERS)
-    return session
-
-
-def is_safe_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return parsed.scheme in ALLOWED_SCHEMES and parsed.netloc.lower() != ""
-    except Exception:
-        return False
-
-
-def domain_in_allowlist(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return parsed.netloc.lower() in ALLOWED_DOMAINS
-    except Exception:
-        return False
-
-
-def sanitize_text(text: Any, max_len: int = 300) -> str:
-    if text is None:
-        return ""
-    text = str(text).strip()
-    text = re.sub(r"\s+", " ", text)
-    if len(text) > max_len:
-        text = text[: max_len - 3] + "..."
-    return text
-
-
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        digits = re.sub(r"[^0-9-]", "", str(value))
-        return int(digits) if digits else default
-    except Exception:
-        return default
-
-
-def normalize_post(post: Dict[str, Any], subreddit: str, source: str) -> Optional[Dict[str, Any]]:
-    title = sanitize_text(post.get("title", ""), 200)
-    content = sanitize_text(post.get("content", ""), 600)
-    link = str(post.get("link", "")).strip()
-    score = safe_int(post.get("score", 0))
-    comments = safe_int(post.get("comments", 0))
-
-    if not title:
-        return None
-    if not is_safe_url(link):
-        return None
-
-    return {
-        "title": title,
-        "content": content,
-        "link": link,
-        "score": max(score, 0),
-        "comments": max(comments, 0),
-        "subreddit": subreddit,
-        "source": source,
+CUSTOM_CSS = """
+<style>
+    .main {
+        background: linear-gradient(180deg, #fff8fb 0%, #fff 100%);
     }
-
-
-def dedupe_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    results = []
-    for p in posts:
-        key = (p.get("title", "").lower(), p.get("link", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append(p)
-    return results
-
-
-def extract_mentions(text: str) -> List[str]:
-    text_lower = text.lower()
-    matches = []
-
-    for brand in KNOWN_BRANDS:
-        if brand.lower() in text_lower:
-            matches.append(brand)
-
-    for keyword in PRODUCT_KEYWORDS:
-        if keyword.lower() in text_lower:
-            matches.append(keyword)
-
-    return matches
-
-
-def get_search_url(brand: str) -> str:
-    q = quote(f"{brand} best product")
-    return f"https://www.reddit.com/search/?q={q}&sort=relevance&t=month"
-
-
-# ---------------------------
-# 抓取函式
-# ---------------------------
-def fetch_redlib(session: requests.Session, sub: str) -> List[Dict[str, Any]]:
-    posts: List[Dict[str, Any]] = []
-
-    for base_url in REDLIB_INSTANCES:
-        if not domain_in_allowlist(base_url):
-            continue
-
-        try:
-            url = f"{base_url}/r/{sub}"
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code != 200:
-                logger.info("Redlib non-200 for %s via %s: %s", sub, base_url, resp.status_code)
-                continue
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            for post_el in soup.select(".post")[:MAX_POSTS_PER_SOURCE]:
-                title_el = post_el.select_one(".post_title a, .post_link")
-                if not title_el:
-                    continue
-
-                title = title_el.get_text(strip=True)
-                href = title_el.get("href", "").strip()
-
-                body_el = post_el.select_one(".post_body, .post_text")
-                body = body_el.get_text(strip=True) if body_el else ""
-
-                score_el = post_el.select_one(".post_score, .score")
-                score = safe_int(score_el.get_text(strip=True) if score_el else "0")
-
-                comment_el = post_el.select_one(".post_comments a, .comment_count")
-                comments = safe_int(comment_el.get_text(strip=True) if comment_el else "0")
-
-                full_url = href if href.startswith("http") else f"{base_url}{href}"
-                if not is_safe_url(full_url):
-                    continue
-
-                post = normalize_post(
-                    {
-                        "title": title,
-                        "content": body,
-                        "link": full_url,
-                        "score": score,
-                        "comments": comments,
-                    },
-                    subreddit=sub,
-                    source="redlib",
-                )
-                if post:
-                    posts.append(post)
-
-            if posts:
-                return dedupe_posts(posts)
-
-        except requests.RequestException as e:
-            logger.warning("fetch_redlib request failed for %s via %s: %s", sub, base_url, e)
-        except Exception as e:
-            logger.warning("fetch_redlib parse failed for %s via %s: %s", sub, base_url, e)
-
-    return []
-
-
-def fetch_google_reddit(session: requests.Session, query: str, subreddit: str = "search") -> List[Dict[str, Any]]:
-    posts: List[Dict[str, Any]] = []
-    params = {"q": f"site:reddit.com {query}", "num": 10, "hl": "en"}
-
-    try:
-        resp = session.get(
-            "https://www.google.com/search",
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            logger.info("Google non-200 for query=%s: %s", query, resp.status_code)
-            return []
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        for result in soup.select("div.g, div[data-sokoban-container]"):
-            link_el = result.select_one("a[href]")
-            title_el = result.select_one("h3")
-            snippet_el = result.select_one(".VwiC3b, .IsZvec")
-
-            if not link_el or not title_el:
-                continue
-
-            href = link_el.get("href", "").strip()
-            title = title_el.get_text(strip=True)
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-
-            if "reddit.com" not in href:
-                continue
-            if not is_safe_url(href):
-                continue
-
-            post = normalize_post(
-                {
-                    "title": title,
-                    "content": snippet,
-                    "link": href,
-                    "score": 0,
-                    "comments": 0,
-                },
-                subreddit=subreddit,
-                source="google",
-            )
-            if post:
-                posts.append(post)
-
-    except requests.RequestException as e:
-        logger.warning("fetch_google_reddit request failed for query=%s: %s", query, e)
-    except Exception as e:
-        logger.warning("fetch_google_reddit parse failed for query=%s: %s", query, e)
-
-    return dedupe_posts(posts)
-
-
-def fetch_ddg_reddit(session: requests.Session, query: str, subreddit: str = "search") -> List[Dict[str, Any]]:
-    posts: List[Dict[str, Any]] = []
-
-    try:
-        resp = session.get(
-            "https://lite.duckduckgo.com/lite/",
-            params={"q": f"site:reddit.com {query}"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if resp.status_code != 200:
-            logger.info("DDG non-200 for query=%s: %s", query, resp.status_code)
-            return []
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        for link in soup.select("a.result-link")[:10]:
-            href = link.get("href", "").strip()
-            title = link.get_text(strip=True)
-
-            if "reddit.com" not in href:
-                continue
-            if not is_safe_url(href):
-                continue
-
-            post = normalize_post(
-                {
-                    "title": title,
-                    "content": "",
-                    "link": href,
-                    "score": 0,
-                    "comments": 0,
-                },
-                subreddit=subreddit,
-                source="duckduckgo",
-            )
-            if post:
-                posts.append(post)
-
-    except requests.RequestException as e:
-        logger.warning("fetch_ddg_reddit request failed for query=%s: %s", query, e)
-    except Exception as e:
-        logger.warning("fetch_ddg_reddit parse failed for query=%s: %s", query, e)
-
-    return dedupe_posts(posts)
-
-
-# ---------------------------
-# 主分析邏輯
-# ---------------------------
-def aggregate_brand_stats(all_posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    brand_stats: Dict[str, Dict[str, Any]] = {}
-
-    for post in all_posts:
-        engagement = post["score"] + post["comments"] * 2
-        combined = f"{post['title']} {post['content']}"
-        mentions = extract_mentions(combined)
-
-        if not mentions:
-            continue
-
-        for mention in mentions:
-            if mention not in brand_stats:
-                brand_stats[mention] = {
-                    "brand": mention,
-                    "total_engagement": 0,
-                    "mention_count": 0,
-                    "total_score": 0,
-                    "total_comments": 0,
-                    "top_posts": [],
-                }
-
-            item = brand_stats[mention]
-            item["total_engagement"] += engagement
-            item["mention_count"] += 1
-            item["total_score"] += post["score"]
-            item["total_comments"] += post["comments"]
-
-            if len(item["top_posts"]) < MAX_TOP_POSTS_PER_BRAND:
-                item["top_posts"].append(post)
-            else:
-                smallest_idx = min(
-                    range(len(item["top_posts"])),
-                    key=lambda i: item["top_posts"][i]["score"] + item["top_posts"][i]["comments"] * 2,
-                )
-                smallest_value = (
-                    item["top_posts"][smallest_idx]["score"]
-                    + item["top_posts"][smallest_idx]["comments"] * 2
-                )
-                if engagement > smallest_value:
-                    item["top_posts"][smallest_idx] = post
-
-    results = sorted(
-        brand_stats.values(),
-        key=lambda x: (x["total_engagement"], x["mention_count"]),
-        reverse=True,
-    )
-
-    for item in results:
-        item["top_posts"] = sorted(
-            item["top_posts"],
-            key=lambda p: (p["score"] + p["comments"] * 2),
-            reverse=True,
-        )
-
-    return results[:30]
+    .hero {
+        padding: 1.2rem 1.4rem;
+        border-radius: 20px;
+        background: linear-gradient(135deg, #ffedf4 0%, #f7ecff 100%);
+        border: 1px solid rgba(233, 30, 99, 0.12);
+        margin-bottom: 1rem;
+    }
+    .hero h1 {
+        margin: 0;
+        color: #c2185b;
+        font-size: 2rem;
+    }
+    .hero p {
+        margin: 0.5rem 0 0 0;
+        color: #6a5160;
+        font-size: 0.98rem;
+    }
+    .card {
+        background: #ffffff;
+        border: 1px solid #f1d8e4;
+        border-radius: 18px;
+        padding: 16px 18px;
+        box-shadow: 0 6px 20px rgba(80, 20, 50, 0.05);
+        margin-bottom: 12px;
+    }
+    .rank {
+        font-size: 1.15rem;
+        font-weight: 800;
+        color: #d81b60;
+    }
+    .subtle {
+        color: #7a6a72;
+        font-size: 0.9rem;
+    }
+    .tiny {
+        color: #8d7b84;
+        font-size: 0.8rem;
+    }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def cached_scrape_reddit() -> Dict[str, Any]:
-    session = create_session()
-    all_posts: List[Dict[str, Any]] = []
-    method_counts = Counter()
-    progress_logs = []
-
-    for sub in SUBREDDITS:
-        progress_logs.append(f"正在抓取 r/{sub}...")
-
-        posts = fetch_redlib(session, sub)
-
-        if posts:
-            method_counts["redlib"] += 1
-            progress_logs.append(f"✓ r/{sub}: {len(posts)} 筆（redlib）")
-        else:
-            queries = [
-                f"r/{sub} best product",
-                f"r/{sub} holy grail",
-                f"r/{sub} favorite 2025",
-            ]
-            temp_posts = []
-            for q in queries:
-                temp_posts.extend(fetch_google_reddit(session, q, subreddit=sub))
-                time.sleep(SEARCH_DELAY_SECONDS)
-
-            if temp_posts:
-                posts = dedupe_posts(temp_posts)
-                method_counts["google"] += 1
-                progress_logs.append(f"✓ r/{sub}: {len(posts)} 筆（Google）")
-            else:
-                temp_posts = []
-                for q in queries:
-                    temp_posts.extend(fetch_ddg_reddit(session, q, subreddit=sub))
-                    time.sleep(SEARCH_DELAY_SECONDS)
-
-                if temp_posts:
-                    posts = dedupe_posts(temp_posts)
-                    method_counts["ddg"] += 1
-                    progress_logs.append(f"✓ r/{sub}: {len(posts)} 筆（DuckDuckGo）")
-                else:
-                    method_counts["failed"] += 1
-                    progress_logs.append(f"✗ r/{sub}: 所有方法失敗")
-                    posts = []
-
-        all_posts.extend(posts)
-        time.sleep(SEARCH_DELAY_SECONDS)
-
-    search_queries = [
-        "best makeup 2025 reddit",
-        "holy grail beauty product reddit",
-        "favorite skincare reddit",
-        "best foundation reddit",
-        "best blush reddit",
-        "best serum reddit",
-        "best moisturizer reddit",
-        "must have beauty product reddit",
-        "best drugstore makeup reddit",
-        "HG makeup reddit",
-    ]
-
-    for query in search_queries:
-        progress_logs.append(f"搜尋：{query}")
-        posts = fetch_google_reddit(session, query)
-        if not posts:
-            posts = fetch_ddg_reddit(session, query)
-
-        all_posts.extend(posts)
-        time.sleep(SEARCH_DELAY_SECONDS)
-
-    all_posts = dedupe_posts(all_posts)
-    products = aggregate_brand_stats(all_posts)
-
-    return {
-        "products": products,
-        "post_count": len(all_posts),
-        "method_counts": dict(method_counts),
-        "progress_logs": progress_logs,
-        "generated_at": int(time.time()),
-    }
+def cached_run_analysis(
+    selected_subreddits,
+    allowed_categories,
+    only_2026,
+    include_hot,
+    include_top_year,
+    include_new,
+    per_feed_limit,
+):
+    return run_analysis(
+        selected_subreddits=list(selected_subreddits),
+        allowed_categories=list(allowed_categories),
+        only_2026=only_2026,
+        include_hot=include_hot,
+        include_top_year=include_top_year,
+        include_new=include_new,
+        per_feed_limit=per_feed_limit,
+    )
 
 
 def check_rate_limit() -> bool:
     now = time.time()
     last_run = st.session_state.get("last_run_ts", 0)
-
     if now - last_run < SESSION_RATE_LIMIT_SECONDS:
-        remain = int(SESSION_RATE_LIMIT_SECONDS - (now - last_run))
-        st.warning(f"請稍候再試，約 {remain} 秒後可重新抓取。")
+        wait_sec = int(SESSION_RATE_LIMIT_SECONDS - (now - last_run))
+        st.warning(f"請稍候再重新分析，約 {wait_sec} 秒後可再次執行。")
         return False
-
     st.session_state["last_run_ts"] = now
     return True
 
 
-# ---------------------------
-# UI
-# ---------------------------
-st.title("💄 北美流行化妝品排名")
-st.caption("從美妝相關 Reddit 討論來源整理熱門品牌／產品關鍵字排行")
+st.markdown("""
+<div class="hero">
+    <h1>💄 北美流行化妝品排行</h1>
+    <p>
+        依據 Reddit 美妝社群公開貼文整理品牌／彩妝關鍵字熱度，
+        適合做北美美妝趨勢觀察、作品集展示與市場研究草稿。
+    </p>
+</div>
+""", unsafe_allow_html=True)
 
-with st.expander("資料來源與限制", expanded=False):
-    st.write("• 來源包含 Reddit 相關搜尋結果與公開鏡像頁面。")
-    st.write("• 本工具為趨勢觀察用途，不代表官方銷量、專業評測或醫療建議。")
-    st.write("• 搜尋結果頁結構可能變動，因此資料完整性與穩定性有限。")
+with st.sidebar:
+    st.header("⚙️ 分析設定")
 
-col_a, col_b = st.columns([2, 1])
+    selected_subreddits = st.multiselect(
+        "選擇要分析的 subreddit",
+        SUBREDDITS,
+        default=SUBREDDITS,
+    )
 
-with col_a:
-    if st.button("🔍 開始分析", type="primary", use_container_width=True):
-        if check_rate_limit():
-            with st.spinner("正在抓取與分析資料，請稍候..."):
-                result = cached_scrape_reddit()
-                st.session_state["result"] = result
+    category_label = st.radio(
+        "分析範圍",
+        ["只看彩妝", "只看保養", "彩妝 + 保養"],
+        index=0,
+    )
 
-with col_b:
-    if st.button("♻️ 重新整理快取結果", use_container_width=True):
-        cached_scrape_reddit.clear()
-        st.success("快取已清除，下一次會重新抓取。")
+    if category_label == "只看彩妝":
+        allowed_categories = ["makeup"]
+    elif category_label == "只看保養":
+        allowed_categories = ["skincare"]
+    else:
+        allowed_categories = ["makeup", "skincare"]
 
-if "result" not in st.session_state:
-    st.info("點擊「開始分析」後，系統會整理北美美妝熱門討論。")
-else:
+    only_2026 = st.toggle("只分析 2026 熱門內容", value=True)
+
+    st.divider()
+    st.caption("資料源設定")
+
+    include_hot = st.checkbox("抓取 Hot", value=True)
+    include_top_year = st.checkbox("抓取 Top（year）", value=True)
+    include_new = st.checkbox("抓取 New", value=False)
+
+    per_feed_limit = st.slider(
+        "每個 feed 抓取數量",
+        min_value=10,
+        max_value=50,
+        value=25,
+        step=5,
+    )
+
+    st.divider()
+    if st.button("♻️ 清除快取", use_container_width=True):
+        cached_run_analysis.clear()
+        st.success("已清除快取。")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("預設分析社群", len(selected_subreddits))
+col2.metric("資料來源", "Reddit JSON")
+col3.metric("年度篩選", "2026" if only_2026 else "不限")
+
+with st.expander("資料來源與方法說明", expanded=False):
+    st.write("• 本版優先使用 Reddit 公開 JSON feed，而非搜尋引擎 HTML 爬取。")
+    st.write("• 可分析 hot / top(year) / new 三種貼文流。")
+    st.write("• 2026 篩選為作品集用途的趨勢過濾，屬啟發式規則，不是官方年份標記。")
+    st.write("• 本工具適合做市場趨勢觀察，不代表實際銷售排行。")
+
+run_col, info_col = st.columns([1.2, 2])
+
+with run_col:
+    run_clicked = st.button("🔍 開始分析", type="primary", use_container_width=True)
+
+with info_col:
+    st.info("建議先分析彩妝類別；若要更廣的美容趨勢，再切換成「彩妝 + 保養」。")
+
+if run_clicked:
+    if not selected_subreddits:
+        st.error("請至少選擇一個 subreddit。")
+    elif not (include_hot or include_top_year or include_new):
+        st.error("請至少選擇一種資料源 feed。")
+    elif check_rate_limit():
+        with st.spinner("正在抓取 Reddit 公開資料並分析，請稍候..."):
+            result = cached_run_analysis(
+                tuple(selected_subreddits),
+                tuple(allowed_categories),
+                only_2026,
+                include_hot,
+                include_top_year,
+                include_new,
+                per_feed_limit,
+            )
+            st.session_state["result"] = result
+
+if "result" in st.session_state:
     result = st.session_state["result"]
     products = result["products"]
-    post_count = result["post_count"]
+    raw_post_count = result["raw_post_count"]
+    filtered_post_count = result["filtered_post_count"]
     method_counts = result["method_counts"]
     progress_logs = result["progress_logs"]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("熱門品牌/產品", len(products))
-    c2.metric("分析貼文數", post_count)
-    c3.metric("爬取版面", len(SUBREDDITS))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("抓取原始貼文", raw_post_count)
+    m2.metric("有效分析貼文", filtered_post_count)
+    m3.metric("熱門品牌/關鍵字", len(products))
+    m4.metric("分析社群", len(selected_subreddits))
 
-    st.divider()
-
-    method_text = " / ".join(f"{k}: {v}" for k, v in method_counts.items()) if method_counts else "無統計"
-    st.caption(f"抓取方式統計：{method_text}")
+    st.caption(
+        "Feed 統計：" +
+        " / ".join(f"{k}: {v}" for k, v in method_counts.items()) if method_counts else "Feed 統計：無"
+    )
 
     with st.expander("抓取紀錄", expanded=False):
         for line in progress_logs:
             st.write(sanitize_text(line, 300))
 
-    st.subheader("排行榜")
+    st.divider()
+    st.subheader("🏆 排行榜")
 
-    for idx, item in enumerate(products, start=1):
-        brand = sanitize_text(item["brand"], 100)
-        search_url = get_search_url(brand)
+    if not products:
+        st.warning("目前沒有符合條件的結果。你可以關閉「只分析 2026 熱門內容」後再試一次。")
+    else:
+        for idx, item in enumerate(products, start=1):
+            brand = sanitize_text(item["brand"], 100)
+            mention_count = item["mention_count"]
+            total_engagement = item["total_engagement"]
+            total_score = item["total_score"]
+            total_comments = item["total_comments"]
+            subreddits = ", ".join(item.get("subreddits", []))
+            reddit_search_url = get_reddit_search_url(brand)
 
-        with st.container(border=True):
-            left, right = st.columns([3, 1])
+            st.markdown(f"""
+            <div class="card">
+                <div class="rank">#{idx} {html.escape(brand)}</div>
+                <div class="subtle">
+                    提及次數：{mention_count} ｜ 互動分：{total_engagement} ｜ 
+                    帖文分數：{total_score} ｜ 留言數：{total_comments}
+                </div>
+                <div class="tiny">出現版面：{html.escape(subreddits)}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-            with left:
-                st.markdown(f"### #{idx} {html.escape(brand)}")
-                st.write(
-                    f"提及次數：{item['mention_count']} ｜ "
-                    f"互動分：{item['total_engagement']} ｜ "
-                    f"貼文分數：{item['total_score']} ｜ "
-                    f"留言數：{item['total_comments']}"
-                )
+            b1, b2 = st.columns([1, 4])
+            with b1:
+                if is_safe_url(reddit_search_url):
+                    st.link_button(f"搜尋 {brand}", reddit_search_url, use_container_width=True)
 
-                if is_safe_url(search_url):
-                    st.link_button(
-                        label=f"在 Reddit 搜尋 {brand}",
-                        url=search_url,
-                        use_container_width=False,
-                    )
-
-            with right:
-                st.metric("提及次數", item["mention_count"])
-                st.metric("互動分", item["total_engagement"])
-
-            if item["top_posts"]:
+            with b2:
                 with st.expander("查看代表貼文", expanded=False):
-                    for post in item["top_posts"]:
-                        title = sanitize_text(post["title"], 120)
-                        source = sanitize_text(post["source"], 20)
-                        subreddit = sanitize_text(post["subreddit"], 40)
-                        score = post["score"]
-                        comments = post["comments"]
-                        link = post["link"]
+                    top_posts = item.get("top_posts", [])
+                    if not top_posts:
+                        st.write("無代表貼文")
+                    else:
+                        for p in top_posts:
+                            title = sanitize_text(p["title"], 140)
+                            subreddit = sanitize_text(p["subreddit"], 40)
+                            source = sanitize_text(p["source"], 40)
+                            score = p["score"]
+                            comments = p["comments"]
+                            link = p["link"]
 
-                        st.write(
-                            f"**{title}**  \n"
-                            f"來源：{source} ｜ 版面：{subreddit} ｜ "
-                            f"分數：{score} ｜ 留言：{comments}"
-                        )
-
-                        if is_safe_url(link):
-                            st.link_button(
-                                label=f"開啟貼文：{title[:40]}",
-                                url=link,
-                                use_container_width=False,
+                            st.write(
+                                f"**{title}**  \n"
+                                f"版面：{subreddit} ｜ 來源：{source} ｜ 👍 {score} ｜ 💬 {comments}"
                             )
 
-    st.divider()
-    st.subheader("原始統計表")
+                            if is_safe_url(link):
+                                st.link_button(
+                                    label=f"開啟貼文：{title[:36]}",
+                                    url=link,
+                                    use_container_width=False,
+                                )
 
-    df_data = [
-        {
-            "排名": i + 1,
-            "品牌/產品": sanitize_text(p["brand"], 100),
-            "提及次數": p["mention_count"],
-            "互動分": p["total_engagement"],
-            "貼文分數": p["total_score"],
-            "留言數": p["total_comments"],
-        }
-        for i, p in enumerate(products)
-    ]
+        st.divider()
+        st.subheader("📊 原始統計表")
 
-    df = pd.DataFrame(df_data)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+        df = pd.DataFrame([
+            {
+                "排名": i + 1,
+                "品牌/關鍵字": sanitize_text(p["brand"], 100),
+                "提及次數": p["mention_count"],
+                "互動分": p["total_engagement"],
+                "貼文分數": p["total_score"],
+                "留言數": p["total_comments"],
+                "出現版面": ", ".join(p.get("subreddits", [])),
+            }
+            for i, p in enumerate(products)
+        ])
+
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+else:
+    st.info("請在左側設定條件後，點擊「開始分析」。")
