@@ -1,7 +1,6 @@
 import logging
 import re
 import time
-from collections import Counter
 from typing import Any, Dict, List
 from urllib.parse import quote
 
@@ -12,21 +11,25 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
-GOOGLE_TRENDS_TRENDING_URL = "https://trends.google.com/trending?geo=US"
 REQUEST_TIMEOUT = 20
 
-KNOWN_BRANDS = [
+# 參考 Sephora / Ulta 常見北美美妝品牌池
+DEFAULT_BRANDS = [
     "Rare Beauty", "Fenty Beauty", "NARS", "Charlotte Tilbury", "MAC",
-    "Urban Decay", "Too Faced", "Tarte", "Benefit", "Clinique",
-    "Estee Lauder", "Lancome", "Maybelline", "L'Oreal", "Revlon",
-    "NYX", "e.l.f.", "Elf", "CeraVe", "The Ordinary", "Paula's Choice",
-    "Drunk Elephant", "Tatcha", "Glossier", "Tower 28", "Kosas",
-    "Patrick Ta", "Makeup by Mario", "Natasha Denona",
-    "Huda Beauty", "Anastasia Beverly Hills", "ABH", "Morphe",
-    "Laura Mercier", "Bobbi Brown", "Dior", "Chanel", "YSL",
-    "Tom Ford", "Hourglass", "Colourpop", "ColourPop",
-    "IT Cosmetics", "Mario Badescu", "First Aid Beauty", "Fresh",
-    "Laneige", "Innisfree", "COSRX", "Rhode", "Saie", "Merit",
+    "Urban Decay", "Too Faced", "Tarte", "Benefit Cosmetics", "Clinique",
+    "Estée Lauder", "Estee Lauder", "Lancôme", "Lancome", "Maybelline",
+    "L'Oréal", "Loreal", "Revlon", "NYX", "e.l.f.", "Elf",
+    "CeraVe", "The Ordinary", "Paula's Choice", "Drunk Elephant",
+    "Tatcha", "Glossier", "Tower 28", "Kosas", "Patrick Ta",
+    "Makeup by Mario", "Natasha Denona", "Huda Beauty",
+    "Anastasia Beverly Hills", "ABH", "Morphe", "Laura Mercier",
+    "Bobbi Brown", "Dior", "Chanel", "YSL", "Tom Ford", "Hourglass",
+    "ColourPop", "Colourpop", "IT Cosmetics", "Fresh", "Laneige",
+    "Innisfree", "COSRX", "Rhode", "Saie", "Merit", "Armani Beauty",
+    "Haus Labs", "Milk Makeup", "Too Cool For School", "Beautyblender",
+    "bareMinerals", "Ami Colé", "Basma", "Biossance", "belif",
+    "Beauty of Joseon", "Supergoop!", "Shiseido", "Sol de Janeiro",
+    "Dior Beauty", "Sephora Collection", "Ulta Beauty Collection",
 ]
 
 MAKEUP_KEYWORDS = [
@@ -58,6 +61,11 @@ DEFAULT_MONITOR_TERMS = [
     "Rhode peptide lip treatment",
     "Saie blush",
     "Merit beauty stick",
+    "Haus Labs foundation",
+    "Milk Makeup blush",
+    "Supergoop sunscreen",
+    "Laneige lip mask",
+    "Beauty of Joseon sunscreen",
 ]
 
 TREND_WORDS = [
@@ -99,11 +107,44 @@ def sanitize_text(text: Any, max_len: int = 300) -> str:
     return text
 
 
-def match_beauty_terms(text: str, categories: List[str]) -> List[str]:
+def parse_brand_input(text: str) -> List[str]:
+    if not text:
+        return []
+
+    parts = re.split(r"[\n,;|]+", text)
+    cleaned = []
+    seen = set()
+
+    for part in parts:
+        brand = sanitize_text(part, 80)
+        if not brand:
+            continue
+        key = brand.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(brand)
+
+    return cleaned
+
+
+def dedupe_strings(items: List[str]) -> List[str]:
+    seen = set()
+    result = []
+    for item in items:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def match_beauty_terms(text: str, categories: List[str], brand_pool: List[str]) -> List[str]:
     text_lower = text.lower()
     mentions = []
 
-    for brand in KNOWN_BRANDS:
+    for brand in brand_pool:
         if brand.lower() in text_lower:
             mentions.append(brand)
 
@@ -121,18 +162,12 @@ def match_beauty_terms(text: str, categories: List[str]) -> List[str]:
         if kw.lower() in text_lower:
             mentions.append(kw)
 
-    unique = []
-    seen = set()
-    for m in mentions:
-        if m not in seen:
-            seen.add(m)
-            unique.append(m)
-
-    return unique
+    return dedupe_strings(mentions)
 
 
 def fetch_google_trending_page(session: requests.Session, geo: str = "US") -> List[str]:
     url = f"https://trends.google.com/trending?geo={quote(geo.lower())}"
+
     try:
         resp = session.get(url, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
@@ -161,6 +196,9 @@ def fetch_google_trending_page(session: requests.Session, geo: str = "US") -> Li
             "started",
             "export",
             "local unavailable",
+            "privacy",
+            "terms",
+            "feedback",
         ]
 
         for line in lines:
@@ -181,27 +219,15 @@ def fetch_google_trending_page(session: requests.Session, geo: str = "US") -> Li
         return []
 
 
-def dedupe_strings(items: List[str]) -> List[str]:
-    seen = set()
-    result = []
-    for item in items:
-        key = item.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(item)
-    return result
-
-
-def score_term(term: str, categories: List[str]) -> Dict[str, Any]:
-    mentions = match_beauty_terms(term, categories)
+def score_term(term: str, categories: List[str], brand_pool: List[str]) -> Dict[str, Any]:
+    mentions = match_beauty_terms(term, categories, brand_pool)
     if not mentions:
         return {}
 
     score = len(mentions) * 10
     term_lower = term.lower()
 
-    for brand in KNOWN_BRANDS:
+    for brand in brand_pool:
         if brand.lower() in term_lower:
             score += 20
 
@@ -214,10 +240,10 @@ def score_term(term: str, categories: List[str]) -> Dict[str, Any]:
     }
 
 
-def build_monitor_results(categories: List[str]) -> List[Dict[str, Any]]:
+def build_monitor_results(categories: List[str], brand_pool: List[str]) -> List[Dict[str, Any]]:
     results = []
     for term in DEFAULT_MONITOR_TERMS:
-        mentions = match_beauty_terms(term, categories)
+        mentions = match_beauty_terms(term, categories, brand_pool)
         if not mentions:
             continue
         results.append({
@@ -226,6 +252,20 @@ def build_monitor_results(categories: List[str]) -> List[Dict[str, Any]]:
             "trend_score": len(mentions) * 8,
             "mentions": mentions,
             "source": "beauty_monitor_list",
+        })
+
+    # 額外加入使用者品牌池的監測詞
+    for brand in brand_pool[:40]:
+        synthetic_term = f"{brand} best seller"
+        mentions = match_beauty_terms(synthetic_term, categories, brand_pool)
+        if not mentions:
+            continue
+        results.append({
+            "keyword": synthetic_term,
+            "mention_count": len(mentions),
+            "trend_score": len(mentions) * 6,
+            "mentions": mentions,
+            "source": "custom_brand_monitor",
         })
 
     results.sort(key=lambda x: (x["trend_score"], x["mention_count"]), reverse=True)
@@ -275,19 +315,40 @@ def aggregate_mentions(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         key=lambda x: (x["total_score"], x["mention_count"]),
         reverse=True,
     )
-    return final[:30]
+    return final[:50]
 
 
-def run_analysis(geo: str, categories: List[str], use_monitor_fallback: bool = True) -> Dict[str, Any]:
+def build_brand_pool(use_default_brands: bool, custom_brands: List[str]) -> List[str]:
+    pool = []
+    if use_default_brands:
+        pool.extend(DEFAULT_BRANDS)
+    pool.extend(custom_brands)
+    return dedupe_strings(pool)
+
+
+def run_analysis(
+    geo: str,
+    categories: List[str],
+    use_monitor_fallback: bool,
+    use_default_brands: bool,
+    custom_brands: List[str],
+) -> Dict[str, Any]:
     session = create_session()
     progress_logs = []
 
+    brand_pool = build_brand_pool(
+        use_default_brands=use_default_brands,
+        custom_brands=custom_brands,
+    )
+
+    progress_logs.append(f"品牌池數量：{len(brand_pool)}")
     progress_logs.append(f"抓取 Google Trends Trending Now（{geo}）...")
+
     live_terms = fetch_google_trending_page(session, geo=geo)
 
     scored_live = []
     for term in live_terms:
-        row = score_term(term, categories)
+        row = score_term(term, categories, brand_pool)
         if row:
             scored_live.append(row)
 
@@ -299,8 +360,8 @@ def run_analysis(geo: str, categories: List[str], use_monitor_fallback: bool = T
 
     fallback_terms = []
     if use_monitor_fallback and len(scored_live) < 5:
-        progress_logs.append("即時美妝趨勢不足，啟用內建美妝監測關鍵字庫...")
-        fallback_terms = build_monitor_results(categories)
+        progress_logs.append("即時美妝趨勢不足，啟用品牌監測關鍵字庫...")
+        fallback_terms = build_monitor_results(categories, brand_pool)
 
     combined = scored_live + fallback_terms
     aggregated = aggregate_mentions(combined)
@@ -313,4 +374,5 @@ def run_analysis(geo: str, categories: List[str], use_monitor_fallback: bool = T
         "progress_logs": progress_logs,
         "generated_at": int(time.time()),
         "raw_live_terms": live_terms[:50],
+        "brand_pool": brand_pool,
     }
