@@ -234,6 +234,7 @@ def filter_posts(
 
         if only_2026:
             text_lower = combined.lower()
+            # 寬鬆規則：文字提及 2026，或標題帶今年愛用品等
             if (
                 "2026" not in text_lower
                 and "this year" not in text_lower
