@@ -26,10 +26,12 @@ DEFAULT_BRANDS = [
     "Bobbi Brown", "Dior", "Chanel", "YSL", "Tom Ford", "Hourglass",
     "ColourPop", "Colourpop", "IT Cosmetics", "Fresh", "Laneige",
     "Innisfree", "COSRX", "Rhode", "Saie", "Merit", "Armani Beauty",
-    "Haus Labs", "Milk Makeup", "Too Cool For School", "Beautyblender",
-    "bareMinerals", "Ami Colé", "Basma", "Biossance", "belif",
+    "Haus Labs", "Milk Makeup", "Beautyblender", "bareMinerals",
+    "Ami Colé", "Basma", "Biossance", "belif",
     "Beauty of Joseon", "Supergoop!", "Shiseido", "Sol de Janeiro",
     "Dior Beauty", "Sephora Collection", "Ulta Beauty Collection",
+    "about-face", "PAT McGRATH LABS", "Tula", "A313", "Ahava",
+    "Algenist", "ANUA", "Aquaphor", "Ardell", "OUAI",
 ]
 
 MAKEUP_KEYWORDS = [
@@ -52,8 +54,6 @@ DEFAULT_MONITOR_TERMS = [
     "NARS concealer",
     "Maybelline mascara",
     "e.l.f. blush",
-    "Sephora best makeup",
-    "Ulta viral makeup",
     "CeraVe moisturizer",
     "The Ordinary serum",
     "Tower 28 blush",
@@ -66,6 +66,8 @@ DEFAULT_MONITOR_TERMS = [
     "Supergoop sunscreen",
     "Laneige lip mask",
     "Beauty of Joseon sunscreen",
+    "PAT McGRATH LABS palette",
+    "about-face eye paint",
 ]
 
 TREND_WORDS = [
@@ -140,7 +142,15 @@ def dedupe_strings(items: List[str]) -> List[str]:
     return result
 
 
-def match_beauty_terms(text: str, categories: List[str], brand_pool: List[str]) -> List[str]:
+def build_brand_pool(use_default_brands: bool, custom_brands: List[str]) -> List[str]:
+    pool = []
+    if use_default_brands:
+        pool.extend(DEFAULT_BRANDS)
+    pool.extend(custom_brands)
+    return dedupe_strings(pool)
+
+
+def find_brand_mentions(text: str, brand_pool: List[str]) -> List[str]:
     text_lower = text.lower()
     mentions = []
 
@@ -148,21 +158,22 @@ def match_beauty_terms(text: str, categories: List[str], brand_pool: List[str]) 
         if brand.lower() in text_lower:
             mentions.append(brand)
 
-    if "makeup" in categories:
-        for kw in MAKEUP_KEYWORDS:
-            if kw.lower() in text_lower:
-                mentions.append(kw)
-
-    if "skincare" in categories:
-        for kw in SKINCARE_KEYWORDS:
-            if kw.lower() in text_lower:
-                mentions.append(kw)
-
-    for kw in TREND_WORDS:
-        if kw.lower() in text_lower:
-            mentions.append(kw)
-
     return dedupe_strings(mentions)
+
+
+def is_beauty_related(text: str, categories: List[str]) -> bool:
+    text_lower = text.lower()
+
+    if any(word.lower() in text_lower for word in TREND_WORDS):
+        return True
+
+    if "makeup" in categories and any(word.lower() in text_lower for word in MAKEUP_KEYWORDS):
+        return True
+
+    if "skincare" in categories and any(word.lower() in text_lower for word in SKINCARE_KEYWORDS):
+        return True
+
+    return False
 
 
 def fetch_google_trending_page(session: requests.Session, geo: str = "US") -> List[str]:
@@ -220,78 +231,90 @@ def fetch_google_trending_page(session: requests.Session, geo: str = "US") -> Li
 
 
 def score_term(term: str, categories: List[str], brand_pool: List[str]) -> Dict[str, Any]:
-    mentions = match_beauty_terms(term, categories, brand_pool)
-    if not mentions:
+    brand_mentions = find_brand_mentions(term, brand_pool)
+    if not brand_mentions:
         return {}
 
-    score = len(mentions) * 10
-    term_lower = term.lower()
+    # 這個詞如果完全不含品牌，就不進排行
+    # 但仍希望它跟美妝相關，避免非美妝品牌撞詞
+    if not is_beauty_related(term, categories):
+        return {}
 
-    for brand in brand_pool:
-        if brand.lower() in term_lower:
-            score += 20
+    score = len(brand_mentions) * 20
 
     return {
         "keyword": term,
-        "mention_count": len(mentions),
+        "brand_mentions": brand_mentions,
         "trend_score": score,
-        "mentions": mentions,
         "source": "google_trends_trending_now",
     }
 
 
 def build_monitor_results(categories: List[str], brand_pool: List[str]) -> List[Dict[str, Any]]:
     results = []
+
     for term in DEFAULT_MONITOR_TERMS:
-        mentions = match_beauty_terms(term, categories, brand_pool)
-        if not mentions:
+        brand_mentions = find_brand_mentions(term, brand_pool)
+        if not brand_mentions:
             continue
+        if not is_beauty_related(term, categories):
+            continue
+
         results.append({
             "keyword": term,
-            "mention_count": len(mentions),
-            "trend_score": len(mentions) * 8,
-            "mentions": mentions,
+            "brand_mentions": brand_mentions,
+            "trend_score": len(brand_mentions) * 15,
             "source": "beauty_monitor_list",
         })
 
-    # 額外加入使用者品牌池的監測詞
-    for brand in brand_pool[:40]:
-        synthetic_term = f"{brand} best seller"
-        mentions = match_beauty_terms(synthetic_term, categories, brand_pool)
-        if not mentions:
-            continue
-        results.append({
-            "keyword": synthetic_term,
-            "mention_count": len(mentions),
-            "trend_score": len(mentions) * 6,
-            "mentions": mentions,
-            "source": "custom_brand_monitor",
-        })
+    for brand in brand_pool[:60]:
+        synthetic_terms = [
+            f"{brand} blush" if "makeup" in categories else "",
+            f"{brand} serum" if "skincare" in categories else "",
+            f"{brand} Sephora",
+            f"{brand} Ulta",
+        ]
 
-    results.sort(key=lambda x: (x["trend_score"], x["mention_count"]), reverse=True)
+        for term in synthetic_terms:
+            if not term:
+                continue
+            brand_mentions = find_brand_mentions(term, brand_pool)
+            if not brand_mentions:
+                continue
+            if not is_beauty_related(term, categories):
+                continue
+
+            results.append({
+                "keyword": term,
+                "brand_mentions": brand_mentions,
+                "trend_score": len(brand_mentions) * 10,
+                "source": "custom_brand_monitor",
+            })
+
+    results.sort(key=lambda x: x["trend_score"], reverse=True)
     return results
 
 
-def aggregate_mentions(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def aggregate_brand_rankings(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     stats: Dict[str, Dict[str, Any]] = {}
 
     for item in results:
         keyword = item.get("keyword", "")
         trend_score = item.get("trend_score", 0)
         source = item.get("source", "")
-        mentions = item.get("mentions", [])
+        brand_mentions = item.get("brand_mentions", [])
 
-        for mention in mentions:
-            if mention not in stats:
-                stats[mention] = {
-                    "brand": mention,
+        for brand in brand_mentions:
+            if brand not in stats:
+                stats[brand] = {
+                    "brand": brand,
                     "mention_count": 0,
                     "total_score": 0,
                     "top_items": [],
                     "sources": set(),
                 }
 
-            row = stats[mention]
+            row = stats[brand]
             row["mention_count"] += 1
             row["total_score"] += trend_score
             row["sources"].add(source)
@@ -312,18 +335,10 @@ def aggregate_mentions(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         final.append(row)
 
     final.sort(
-        key=lambda x: (x["total_score"], x["mention_count"]),
+        key=lambda x: (x["total_score"], x["mention_count"], x["brand"].lower()),
         reverse=True,
     )
     return final[:50]
-
-
-def build_brand_pool(use_default_brands: bool, custom_brands: List[str]) -> List[str]:
-    pool = []
-    if use_default_brands:
-        pool.extend(DEFAULT_BRANDS)
-    pool.extend(custom_brands)
-    return dedupe_strings(pool)
 
 
 def run_analysis(
@@ -352,19 +367,13 @@ def run_analysis(
         if row:
             scored_live.append(row)
 
-    scored_live = sorted(
-        scored_live,
-        key=lambda x: (x["trend_score"], x["mention_count"]),
-        reverse=True,
-    )
-
     fallback_terms = []
     if use_monitor_fallback and len(scored_live) < 5:
-        progress_logs.append("即時美妝趨勢不足，啟用品牌監測關鍵字庫...")
+        progress_logs.append("即時命中品牌不足，啟用品牌監測關鍵字庫...")
         fallback_terms = build_monitor_results(categories, brand_pool)
 
     combined = scored_live + fallback_terms
-    aggregated = aggregate_mentions(combined)
+    aggregated = aggregate_brand_rankings(combined)
 
     return {
         "aggregated": aggregated,
