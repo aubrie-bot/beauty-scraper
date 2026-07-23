@@ -31,7 +31,7 @@ def scrape_sephora_bestsellers():
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup = BeautifulSoup(resp.text, "html.parser")
         for card in soup.select('[data-comp="ProductGrid"] [data-comp="Product"]'):
             name_tag = card.select_one('[data-at="sku_item_name"]')
             brand_tag = card.select_one('[data-at="brand_name"]')
@@ -61,7 +61,7 @@ def scrape_ulta_bestsellers():
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup = BeautifulSoup(resp.text, "html.parser")
         for card in soup.select(".ProductCard"):
             name_tag = card.select_one(".ProductCard__product")
             brand_tag = card.select_one(".ProductCard__brand")
