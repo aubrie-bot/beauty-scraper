@@ -155,7 +155,7 @@ with st.sidebar:
     )
 
     st.divider()
-    if st.button("♻️ 清除快取", use_container_width=True):
+    if st.button("♻️ 清除快取", width="stretch"):
         cached_run_analysis.clear()
         st.success("已清除快取。")
 
@@ -173,7 +173,7 @@ with st.expander("資料來源與方法說明", expanded=False):
 run_col, info_col = st.columns([1.2, 2])
 
 with run_col:
-    run_clicked = st.button("🔍 開始分析", type="primary", use_container_width=True)
+    run_clicked = st.button("🔍 開始分析", type="primary", width="stretch")
 
 with info_col:
     st.info("建議先分析彩妝類別；若要更廣的美容趨勢，再切換成「彩妝 + 保養」。")
@@ -248,7 +248,7 @@ if "result" in st.session_state:
             b1, b2 = st.columns([1, 4])
             with b1:
                 if is_safe_url(reddit_search_url):
-                    st.link_button(f"搜尋 {brand}", reddit_search_url, use_container_width=True)
+                    st.link_button(f"搜尋 {brand}", reddit_search_url, width="stretch")
 
             with b2:
                 with st.expander("查看代表貼文", expanded=False):
@@ -273,7 +273,7 @@ if "result" in st.session_state:
                                 st.link_button(
                                     label=f"開啟貼文：{title[:36]}",
                                     url=link,
-                                    use_container_width=False,
+                                    width="content",
                                 )
 
         st.divider()
@@ -292,7 +292,7 @@ if "result" in st.session_state:
             for i, p in enumerate(products)
         ])
 
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
 
 else:
     st.info("請在左側設定條件後，點擊「開始分析」。")
