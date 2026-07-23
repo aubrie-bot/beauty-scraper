@@ -47,8 +47,8 @@ SKINCARE_KEYWORDS = [
 ]
 
 GENERAL_TREND_KEYWORDS = [
-    "holy grail", "hg", "favorite", "favourite", "recommend",
-    "must have", "best of", "2026",
+    "holy grail", "hg", "favorite", "favourite", "favorites", "favourites",
+    "recommend", "recommended", "must have", "best of", "top", "2026",
 ]
 
 ALLOWED_SCHEMES = {"http", "https"}
@@ -113,6 +113,8 @@ def normalize_reddit_post(child: Dict[str, Any], subreddit: str, feed_type: str)
     created_utc = safe_int(data.get("created_utc", 0))
     author = sanitize_text(data.get("author", ""), 60)
     over_18 = bool(data.get("over_18", False))
+    is_self = bool(data.get("is_self", False))
+    url_overridden = sanitize_text(data.get("url_overridden_by_dest", ""), 300)
 
     if not title or not permalink or over_18:
         return None
@@ -131,10 +133,18 @@ def normalize_reddit_post(child: Dict[str, Any], subreddit: str, feed_type: str)
         "author": author,
         "subreddit": subreddit,
         "source": f"reddit_json_{feed_type}",
+        "is_self": is_self,
+        "outbound_url": url_overridden,
     }
 
 
-def fetch_reddit_feed(session: requests.Session, subreddit: str, feed_type: str = "hot", limit: int = 30, time_filter: str = "year") -> List[Dict[str, Any]]:
+def fetch_reddit_feed(
+    session: requests.Session,
+    subreddit: str,
+    feed_type: str = "hot",
+    limit: int = 30,
+    time_filter: str = "year",
+) -> List[Dict[str, Any]]:
     if feed_type not in {"hot", "top", "new"}:
         return []
 
@@ -146,7 +156,10 @@ def fetch_reddit_feed(session: requests.Session, subreddit: str, feed_type: str 
     try:
         resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
-            logger.warning("Reddit feed non-200: subreddit=%s feed=%s code=%s", subreddit, feed_type, resp.status_code)
+            logger.warning(
+                "Reddit feed non-200: subreddit=%s feed=%s code=%s",
+                subreddit, feed_type, resp.status_code
+            )
             return []
 
         payload = resp.json()
@@ -161,22 +174,30 @@ def fetch_reddit_feed(session: requests.Session, subreddit: str, feed_type: str 
         return posts
 
     except requests.RequestException as e:
-        logger.warning("fetch_reddit_feed request error subreddit=%s feed=%s err=%s", subreddit, feed_type, e)
+        logger.warning(
+            "fetch_reddit_feed request error subreddit=%s feed=%s err=%s",
+            subreddit, feed_type, e
+        )
         return []
     except Exception as e:
-        logger.warning("fetch_reddit_feed parse error subreddit=%s feed=%s err=%s", subreddit, feed_type, e)
+        logger.warning(
+            "fetch_reddit_feed parse error subreddit=%s feed=%s err=%s",
+            subreddit, feed_type, e
+        )
         return []
 
 
 def dedupe_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     result = []
+
     for p in posts:
         key = (p.get("title", "").lower(), p.get("link", ""))
         if key in seen:
             continue
         seen.add(key)
         result.append(p)
+
     return result
 
 
@@ -202,10 +223,22 @@ def match_terms(text: str, allowed_categories: List[str]) -> List[str]:
         if kw.lower() in text_lower:
             mentions.append(kw)
 
-    return mentions
+    # 去重但保留順序
+    seen = set()
+    unique_mentions = []
+    for m in mentions:
+        if m not in seen:
+            seen.add(m)
+            unique_mentions.append(m)
+
+    return unique_mentions
 
 
-def filter_posts(posts: List[Dict[str, Any]], allowed_categories: List[str], only_2026: bool = False) -> List[Dict[str, Any]]:
+def filter_posts(
+    posts: List[Dict[str, Any]],
+    allowed_categories: List[str],
+    only_2026: bool = False,
+) -> List[Dict[str, Any]]:
     filtered = []
 
     for post in posts:
@@ -216,7 +249,14 @@ def filter_posts(posts: List[Dict[str, Any]], allowed_categories: List[str], onl
 
         if only_2026:
             text_lower = combined.lower()
-            if "2026" not in text_lower and "best of" not in text_lower and "favorite" not in text_lower and "favourite" not in text_lower:
+            if (
+                "2026" not in text_lower
+                and "best of" not in text_lower
+                and "favorite" not in text_lower
+                and "favorites" not in text_lower
+                and "favourite" not in text_lower
+                and "favourites" not in text_lower
+            ):
                 continue
 
         new_post = dict(post)
@@ -230,7 +270,7 @@ def aggregate_brand_stats(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     stats: Dict[str, Dict[str, Any]] = {}
 
     for post in posts:
-        engagement = post["score"] + post["comments"] * 2
+        engagement = post.get("score", 0) + post.get("comments", 0) * 2
 
         for mention in post.get("mentions", []):
             if mention not in stats:
@@ -247,30 +287,33 @@ def aggregate_brand_stats(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             item = stats[mention]
             item["total_engagement"] += engagement
             item["mention_count"] += 1
-            item["total_score"] += post["score"]
-            item["total_comments"] += post["comments"]
-            item["subreddits"].add(post["subreddit"])
+            item["total_score"] += post.get("score", 0)
+            item["total_comments"] += post.get("comments", 0)
+            item["subreddits"].add(post.get("subreddit", ""))
 
             item["top_posts"].append({
-                "title": post["title"],
-                "link": post["link"],
-                "score": post["score"],
-                "comments": post["comments"],
-                "subreddit": post["subreddit"],
-                "source": post["source"],
+                "title": post.get("title", ""),
+                "link": post.get("link", ""),
+                "score": post.get("score", 0),
+                "comments": post.get("comments", 0),
+                "subreddit": post.get("subreddit", ""),
+                "source": post.get("source", ""),
             })
 
     results = []
     for item in stats.values():
         item["top_posts"] = sorted(
             item.get("top_posts", []),
-            key=lambda x: (x["score"] + x["comments"] * 2),
+            key=lambda x: (x.get("score", 0) + x.get("comments", 0) * 2),
             reverse=True,
         )[:3]
-        item["subreddits"] = sorted(item.get("subreddits", []))
+        item["subreddits"] = sorted([s for s in item.get("subreddits", []) if s])
         results.append(item)
 
-    results.sort(key=lambda x: (x["total_engagement"], x["mention_count"]), reverse=True)
+    results.sort(
+        key=lambda x: (x.get("total_engagement", 0), x.get("mention_count", 0)),
+        reverse=True,
+    )
     return results[:30]
 
 
@@ -279,7 +322,15 @@ def get_reddit_search_url(keyword: str) -> str:
     return f"https://www.reddit.com/search/?q={q}&sort=relevance&t=year"
 
 
-def run_analysis(selected_subreddits: List[str], allowed_categories: List[str], only_2026: bool, include_hot: bool, include_top_year: bool, include_new: bool, per_feed_limit: int = 25) -> Dict[str, Any]:
+def run_analysis(
+    selected_subreddits: List[str],
+    allowed_categories: List[str],
+    only_2026: bool,
+    include_hot: bool,
+    include_top_year: bool,
+    include_new: bool,
+    per_feed_limit: int = 25,
+) -> Dict[str, Any]:
     session = create_session()
 
     all_posts: List[Dict[str, Any]] = []
@@ -310,7 +361,11 @@ def run_analysis(selected_subreddits: List[str], allowed_categories: List[str], 
             time.sleep(0.3)
 
     all_posts = dedupe_posts(all_posts)
-    filtered_posts = filter_posts(all_posts, allowed_categories, only_2026)
+    filtered_posts = filter_posts(
+        all_posts,
+        allowed_categories=allowed_categories,
+        only_2026=only_2026,
+    )
     ranked = aggregate_brand_stats(filtered_posts)
 
     return {
