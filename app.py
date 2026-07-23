@@ -4,7 +4,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from utils import run_analysis, sanitize_text
+from utils import DEFAULT_BRANDS, parse_brand_input, run_analysis, sanitize_text
 
 st.set_page_config(
     page_title="北美美妝趨勢排行 - Google Trends版",
@@ -49,11 +49,13 @@ st.markdown("""
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def cached_run_analysis(geo, categories, use_monitor_fallback):
+def cached_run_analysis(geo, categories, use_monitor_fallback, use_default_brands, custom_brands):
     return run_analysis(
         geo=geo,
         categories=list(categories),
         use_monitor_fallback=use_monitor_fallback,
+        use_default_brands=use_default_brands,
+        custom_brands=list(custom_brands),
     )
 
 
@@ -77,7 +79,7 @@ def clear_all_state():
 st.markdown("""
 <div class="hero">
     <h1>💄 北美美妝趨勢排行</h1>
-    <p>使用 Google Trends Trending Now 頁面，搭配美妝品牌與關鍵字字典，找出北美近期美妝熱詞。</p>
+    <p>使用 Google Trends Trending Now，搭配 Sephora / Ulta 常見品牌池與自訂品牌清單，監測北美美妝熱詞。</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -99,7 +101,26 @@ with st.sidebar:
     else:
         categories = ["makeup", "skincare"]
 
-    use_monitor_fallback = st.toggle("即時趨勢不足時使用監測關鍵字庫", value=True)
+    use_default_brands = st.toggle(
+        "使用 Sephora / Ulta 常見品牌池",
+        value=True,
+    )
+
+    custom_brand_text = st.text_area(
+        "自訂品牌清單（每行一個，或用逗號分隔）",
+        value="Rhode\nSaie\nMerit\nHaus Labs",
+        height=180,
+    )
+
+    custom_brands = parse_brand_input(custom_brand_text)
+
+    use_monitor_fallback = st.toggle(
+        "即時趨勢不足時使用品牌監測關鍵字庫",
+        value=True,
+    )
+
+    st.caption(f"目前自訂品牌數：{len(custom_brands)}")
+    st.caption(f"內建參考品牌數：{len(DEFAULT_BRANDS)}")
 
     if st.button("♻️ 清除快取與狀態", width="stretch"):
         clear_all_state()
@@ -113,6 +134,8 @@ if run_clicked and check_rate_limit():
             geo,
             tuple(categories),
             use_monitor_fallback,
+            use_default_brands,
+            tuple(custom_brands),
         )
         st.session_state["result"] = result
 
@@ -124,11 +147,19 @@ if "result" in st.session_state:
     fallback_used = result.get("fallback_used", False)
     progress_logs = result.get("progress_logs", [])
     raw_live_terms = result.get("raw_live_terms", [])
+    brand_pool = result.get("brand_pool", [])
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("即時趨勢原始詞數", live_terms_count)
     c2.metric("命中美妝趨勢詞", matched_live_count)
     c3.metric("Fallback", "有啟用" if fallback_used else "未啟用")
+    c4.metric("品牌池數量", len(brand_pool))
+
+    with st.expander("目前品牌池", expanded=False):
+        if brand_pool:
+            st.write(", ".join(brand_pool))
+        else:
+            st.write("目前沒有品牌。")
 
     with st.expander("抓取紀錄", expanded=False):
         for line in progress_logs:
