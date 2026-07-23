@@ -46,9 +46,9 @@ SKINCARE_KEYWORDS = [
     "cream", "lotion", "oil", "mask",
 ]
 
-GENERAL_TREND_KEYWORDS = [
-    "holy grail", "hg", "favorite", "favourite", "favorites", "favourites",
-    "recommend", "recommended", "must have", "best of", "top", "2026",
+TREND_WORDS = [
+    "holy grail", "hg", "favorite", "favorites", "favourite",
+    "favourites", "best of", "must have", "recommend", "2026",
 ]
 
 ALLOWED_SCHEMES = {"http", "https"}
@@ -68,7 +68,7 @@ def create_session() -> requests.Session:
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
@@ -76,14 +76,6 @@ def create_session() -> requests.Session:
         "Accept": "application/json,text/plain,*/*",
     })
     return session
-
-
-def is_safe_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        return parsed.scheme in ALLOWED_SCHEMES and parsed.netloc.lower() in ALLOWED_DOMAINS
-    except Exception:
-        return False
 
 
 def sanitize_text(text: Any, max_len: int = 300) -> str:
@@ -103,46 +95,46 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def is_safe_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ALLOWED_SCHEMES and parsed.netloc.lower() in ALLOWED_DOMAINS
+    except Exception:
+        return False
+
+
 def normalize_reddit_post(child: Dict[str, Any], subreddit: str, feed_type: str) -> Optional[Dict[str, Any]]:
     data = child.get("data", {})
     title = sanitize_text(data.get("title", ""), 220)
-    selftext = sanitize_text(data.get("selftext", ""), 1200)
+    selftext = sanitize_text(data.get("selftext", ""), 1000)
     permalink = data.get("permalink", "")
     score = safe_int(data.get("score", 0))
     comments = safe_int(data.get("num_comments", 0))
-    created_utc = safe_int(data.get("created_utc", 0))
-    author = sanitize_text(data.get("author", ""), 60)
     over_18 = bool(data.get("over_18", False))
-    is_self = bool(data.get("is_self", False))
-    url_overridden = sanitize_text(data.get("url_overridden_by_dest", ""), 300)
 
     if not title or not permalink or over_18:
         return None
 
-    full_url = f"https://www.reddit.com{permalink}"
-    if not is_safe_url(full_url):
+    link = f"https://www.reddit.com{permalink}"
+    if not is_safe_url(link):
         return None
 
     return {
         "title": title,
         "content": selftext,
-        "link": full_url,
+        "link": link,
         "score": max(score, 0),
         "comments": max(comments, 0),
-        "created_utc": created_utc,
-        "author": author,
         "subreddit": subreddit,
         "source": f"reddit_json_{feed_type}",
-        "is_self": is_self,
-        "outbound_url": url_overridden,
     }
 
 
 def fetch_reddit_feed(
     session: requests.Session,
     subreddit: str,
-    feed_type: str = "hot",
-    limit: int = 30,
+    feed_type: str,
+    limit: int = 25,
     time_filter: str = "year",
 ) -> List[Dict[str, Any]]:
     if feed_type not in {"hot", "top", "new"}:
@@ -156,10 +148,7 @@ def fetch_reddit_feed(
     try:
         resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
-            logger.warning(
-                "Reddit feed non-200: subreddit=%s feed=%s code=%s",
-                subreddit, feed_type, resp.status_code
-            )
+            logger.warning("non-200 feed subreddit=%s feed=%s code=%s", subreddit, feed_type, resp.status_code)
             return []
 
         payload = resp.json()
@@ -172,36 +161,27 @@ def fetch_reddit_feed(
                 posts.append(post)
 
         return posts
-
     except requests.RequestException as e:
-        logger.warning(
-            "fetch_reddit_feed request error subreddit=%s feed=%s err=%s",
-            subreddit, feed_type, e
-        )
+        logger.warning("request error subreddit=%s feed=%s err=%s", subreddit, feed_type, e)
         return []
     except Exception as e:
-        logger.warning(
-            "fetch_reddit_feed parse error subreddit=%s feed=%s err=%s",
-            subreddit, feed_type, e
-        )
+        logger.warning("parse error subreddit=%s feed=%s err=%s", subreddit, feed_type, e)
         return []
 
 
 def dedupe_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     result = []
-
     for p in posts:
         key = (p.get("title", "").lower(), p.get("link", ""))
         if key in seen:
             continue
         seen.add(key)
         result.append(p)
-
     return result
 
 
-def match_terms(text: str, allowed_categories: List[str]) -> List[str]:
+def match_terms(text: str, categories: List[str]) -> List[str]:
     text_lower = text.lower()
     mentions = []
 
@@ -209,41 +189,35 @@ def match_terms(text: str, allowed_categories: List[str]) -> List[str]:
         if brand.lower() in text_lower:
             mentions.append(brand)
 
-    if "makeup" in allowed_categories:
+    if "makeup" in categories:
         for kw in MAKEUP_KEYWORDS:
             if kw.lower() in text_lower:
                 mentions.append(kw)
 
-    if "skincare" in allowed_categories:
+    if "skincare" in categories:
         for kw in SKINCARE_KEYWORDS:
             if kw.lower() in text_lower:
                 mentions.append(kw)
 
-    for kw in GENERAL_TREND_KEYWORDS:
-        if kw.lower() in text_lower:
-            mentions.append(kw)
+    for word in TREND_WORDS:
+        if word.lower() in text_lower:
+            mentions.append(word)
 
-    # 去重但保留順序
+    unique = []
     seen = set()
-    unique_mentions = []
     for m in mentions:
         if m not in seen:
             seen.add(m)
-            unique_mentions.append(m)
+            unique.append(m)
+    return unique
 
-    return unique_mentions
 
-
-def filter_posts(
-    posts: List[Dict[str, Any]],
-    allowed_categories: List[str],
-    only_2026: bool = False,
-) -> List[Dict[str, Any]]:
+def filter_posts(posts: List[Dict[str, Any]], categories: List[str], only_2026: bool) -> List[Dict[str, Any]]:
     filtered = []
 
     for post in posts:
-        combined = f"{post['title']} {post['content']}"
-        mentions = match_terms(combined, allowed_categories)
+        combined = f"{post.get('title', '')} {post.get('content', '')}"
+        mentions = match_terms(combined, categories)
         if not mentions:
             continue
 
@@ -251,11 +225,11 @@ def filter_posts(
             text_lower = combined.lower()
             if (
                 "2026" not in text_lower
-                and "best of" not in text_lower
                 and "favorite" not in text_lower
                 and "favorites" not in text_lower
                 and "favourite" not in text_lower
                 and "favourites" not in text_lower
+                and "best of" not in text_lower
             ):
                 continue
 
@@ -304,7 +278,7 @@ def aggregate_brand_stats(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for item in stats.values():
         item["top_posts"] = sorted(
             item.get("top_posts", []),
-            key=lambda x: (x.get("score", 0) + x.get("comments", 0) * 2),
+            key=lambda x: x.get("score", 0) + x.get("comments", 0) * 2,
             reverse=True,
         )[:3]
         item["subreddits"] = sorted([s for s in item.get("subreddits", []) if s])
@@ -324,7 +298,7 @@ def get_reddit_search_url(keyword: str) -> str:
 
 def run_analysis(
     selected_subreddits: List[str],
-    allowed_categories: List[str],
+    categories: List[str],
     only_2026: bool,
     include_hot: bool,
     include_top_year: bool,
@@ -332,7 +306,6 @@ def run_analysis(
     per_feed_limit: int = 25,
 ) -> Dict[str, Any]:
     session = create_session()
-
     all_posts: List[Dict[str, Any]] = []
     method_counts = Counter()
     progress_logs = []
@@ -361,15 +334,11 @@ def run_analysis(
             time.sleep(0.3)
 
     all_posts = dedupe_posts(all_posts)
-    filtered_posts = filter_posts(
-        all_posts,
-        allowed_categories=allowed_categories,
-        only_2026=only_2026,
-    )
-    ranked = aggregate_brand_stats(filtered_posts)
+    filtered_posts = filter_posts(all_posts, categories, only_2026)
+    products = aggregate_brand_stats(filtered_posts)
 
     return {
-        "products": ranked,
+        "products": products,
         "raw_post_count": len(all_posts),
         "filtered_post_count": len(filtered_posts),
         "method_counts": dict(method_counts),
