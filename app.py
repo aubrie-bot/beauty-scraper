@@ -6,7 +6,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from collections import Counter
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 SUBREDDITS = [
     "MakeupAddiction",
@@ -16,66 +16,19 @@ SUBREDDITS = [
     "AsianBeauty",
 ]
 
-UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+REDLIB_INSTANCES = [
+    "https://redlib.tux.pizza",
+    "https://redlib.seasi.dev",
+    "https://redlib.catsarch.com",
+    "https://redlib.freedit.eu",
+    "https://red.ngn.tf",
 ]
 
-def get_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": UA_LIST[0],
-        "Accept": "application/json, text/html, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-    return s
-
-def try_json(session, url, params=None):
-    try:
-        resp = session.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        return resp.json().get("data", {}).get("children", [])
-    except Exception:
-        return None
-
-def try_rss(session, url):
-    try:
-        resp = session.get(url, timeout=15)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.content)
-        entries = []
-        for entry in root.findall(".//entry") or root.findall(".//{http://www.w3.org/2005/Atom}entry"):
-            title = entry.findtext("title") or ""
-            content_el = entry.find("content") or entry.find("{http://www.w3.org/2005/Atom}content")
-            content = content_el.text if content_el is not None else ""
-            link_el = entry.find("link") or entry.find("{http://www.w3.org/2005/Atom}link")
-            link = link_el.get("href", "") if link_el is not None else ""
-            author_el = entry.find("author") or entry.find("{http://www.w3.org/2005/Atom}author")
-            author_name = ""
-            if author_el is not None:
-                name_el = author_el.find("name") or author_el.find("{http://www.w3.org/2005/Atom}name")
-                author_name = name_el.text if name_el is not None else ""
-            entries.append({"title": title, "content": content or "", "link": link, "author": author_name})
-        return entries
-    except Exception:
-        return None
-
-def try_html(session, url):
-    try:
-        resp = session.get(url, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        posts = []
-        for post in soup.select("a[data-click-id='body'], a[data-href-click='post'], div[data-testid='post-container']"):
-            title = post.get("aria-label", "") or post.get_text(strip=True)[:200]
-            href = post.get("href", "")
-            if title and href:
-                posts.append({"title": title, "content": "", "link": f"https://www.reddit.com{href}" if href.startswith("/") else href})
-        return posts
-    except Exception:
-        return None
-
+GOOGLE_HTML_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 KNOWN_BRANDS = [
     "Rare Beauty", "Fenty Beauty", "NARS", "Charlotte Tilbury", "MAC",
@@ -100,133 +53,163 @@ PRODUCT_KEYWORDS = [
     "holy grail", "HG", "favorite", "recommend", "must have", "best of",
 ]
 
+
 def extract_mentions(text):
     text_lower = text.lower()
     return [b for b in KNOWN_BRANDS if b.lower() in text_lower] + \
            [k for k in PRODUCT_KEYWORDS if k.lower() in text_lower]
 
 
+def fetch_redlib(session, sub):
+    """Fetch subreddit posts from redlib public instances."""
+    for base_url in REDLIB_INSTANCES:
+        try:
+            resp = session.get(f"{base_url}/r/{sub}", timeout=12, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            })
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            posts = []
+            for post_el in soup.select(".post"):
+                title_el = post_el.select_one(".post_title a, .post_link")
+                if not title_el:
+                    continue
+                title = title_el.get_text(strip=True)
+                href = title_el.get("href", "")
+                body_el = post_el.select_one(".post_body, .post_text")
+                body = body_el.get_text(strip=True) if body_el else ""
+                score_el = post_el.select_one(".post_score, .score")
+                score_text = score_el.get_text(strip=True) if score_el else "0"
+                score = int(re.sub(r"[^0-9-]", "", score_text) or "0")
+                comment_el = post_el.select_one(".post_comments a, .comment_count")
+                comments = 0
+                if comment_el:
+                    ct = re.sub(r"[^0-9]", "", comment_el.get_text(strip=True))
+                    comments = int(ct) if ct else 0
+                full_url = href if href.startswith("http") else f"{base_url}{href}"
+                posts.append({
+                    "title": title, "content": body, "link": full_url,
+                    "score": score, "comments": comments,
+                })
+            if posts:
+                return posts
+        except Exception:
+            continue
+    return []
+
+
+def fetch_google_reddit(session, query):
+    """Use Google search to find Reddit posts about beauty products."""
+    posts = []
+    params = {"q": f"site:reddit.com {query}", "num": 10, "hl": "en"}
+    try:
+        resp = session.get("https://www.google.com/search", params=params, headers=GOOGLE_HTML_HEADERS, timeout=12)
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for result in soup.select("div.g, div[data-sokoban-container]"):
+            link_el = result.select_one("a[href]")
+            title_el = result.select_one("h3")
+            snippet_el = result.select_one(".VwiC3b, .IsZvec")
+            if not link_el or not title_el:
+                continue
+            href = link_el["href"]
+            if "reddit.com" not in href:
+                continue
+            title = title_el.get_text(strip=True)
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            posts.append({
+                "title": title, "content": snippet,
+                "link": href, "score": 0, "comments": 0,
+            })
+    except Exception:
+        pass
+    return posts
+
+
+def fetch_ddg_reddit(session, query):
+    """Use DuckDuckGo Lite to find Reddit beauty posts."""
+    posts = []
+    try:
+        resp = session.get(
+            "https://lite.duckduckgo.com/lite/",
+            params={"q": f"site:reddit.com {query}"},
+            headers=GOOGLE_HTML_HEADERS, timeout=12,
+        )
+        if resp.status_code != 200:
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for link in soup.select("a.result-link"):
+            href = link.get("href", "")
+            title = link.get_text(strip=True)
+            if "reddit.com" in href:
+                posts.append({
+                    "title": title, "content": "", "link": href,
+                    "score": 0, "comments": 0,
+                })
+    except Exception:
+        pass
+    return posts
+
+
 def scrape_reddit():
-    session = get_session()
+    session = requests.Session()
     all_posts = []
-    methods_used = {"json": 0, "rss": 0, "html": 0, "none": 0}
+    method_counts = Counter()
 
     with st.status("爬取 Reddit 中...", expanded=True) as status:
         for sub in SUBREDDITS:
             st.write(f"正在爬取 r/{sub}...")
-            posts_data = []
 
-            data = try_json(session, f"https://www.reddit.com/r/{sub}/hot.json", {"limit": 50, "t": "week"})
-            if data is not None:
-                for item in data:
-                    d = item.get("data", {})
-                    posts_data.append({
-                        "title": d.get("title", ""),
-                        "content": d.get("selftext", ""),
-                        "link": f"https://reddit.com{d.get('permalink', '')}",
-                        "score": d.get("score", 0),
-                        "comments": d.get("num_comments", 0),
-                    })
-                methods_used["json"] += 1
+            posts = fetch_redlib(session, sub)
+            if posts:
+                method_counts["redlib"] += 1
+                st.write(f"  ✓ r/{sub}: {len(posts)} 筆 (redlib)")
             else:
-                data = try_json(session, f"https://old.reddit.com/r/{sub}/hot.json", {"limit": 50, "t": "week"})
-                if data is not None:
-                    for item in data:
-                        d = item.get("data", {})
-                        posts_data.append({
-                            "title": d.get("title", ""),
-                            "content": d.get("selftext", ""),
-                            "link": f"https://reddit.com{d.get('permalink', '')}",
-                            "score": d.get("score", 0),
-                            "comments": d.get("num_comments", 0),
-                        })
-                    methods_used["json"] += 1
-
-            if not posts_data:
-                entries = try_rss(session, f"https://www.reddit.com/r/{sub}/.rss")
-                if entries is not None:
-                    for e in entries:
-                        posts_data.append({
-                            "title": e["title"],
-                            "content": e["content"],
-                            "link": e["link"],
-                            "score": 0,
-                            "comments": 0,
-                        })
-                    methods_used["rss"] += 1
-
-            if not posts_data:
-                entries = try_rss(session, f"https://www.reddit.com/r/{sub}/hot/.rss?limit=50")
-                if entries is not None:
-                    for e in entries:
-                        posts_data.append({
-                            "title": e["title"],
-                            "content": e["content"],
-                            "link": e["link"],
-                            "score": 0,
-                            "comments": 0,
-                        })
-                    methods_used["rss"] += 1
-
-            if not posts_data:
-                html_posts = try_html(session, f"https://www.reddit.com/r/{sub}/hot/")
-                if html_posts:
-                    for hp in html_posts:
-                        posts_data.append({**hp, "score": 0, "comments": 0})
-                    methods_used["html"] += 1
+                queries = [f"r/{sub} best product", f"r/{sub} holy grail", f"r/{sub} favorite 2025"]
+                for q in queries:
+                    posts.extend(fetch_google_reddit(session, q))
+                    time.sleep(1)
+                if posts:
+                    method_counts["google"] += 1
+                    st.write(f"  ✓ r/{sub}: {len(posts)} 筆 (Google)")
                 else:
-                    methods_used["none"] += 1
-                    st.warning(f"r/{sub} 所有方法均失敗")
+                    for q in queries:
+                        posts.extend(fetch_ddg_reddit(session, q))
+                        time.sleep(1)
+                    if posts:
+                        method_counts["ddg"] += 1
+                        st.write(f"  ✓ r/{sub}: {len(posts)} 筆 (DuckDuckGo)")
+                    else:
+                        method_counts["failed"] += 1
+                        st.write(f"  ✗ r/{sub}: 所有方法失敗")
 
-            for p in posts_data:
+            for p in posts:
                 combined = f"{p['title']} {p['content']}"
                 mentions = extract_mentions(combined)
                 if mentions:
                     all_posts.append({**p, "subreddit": sub, "mentions": mentions})
-
-            time.sleep(1.5)
+            time.sleep(1)
 
         search_queries = [
-            "best makeup 2025", "holy grail product", "favorite skincare",
-            "best foundation", "best blush", "best serum", "best moisturizer",
-            "must have beauty", "best drugstore makeup", "HG products",
+            "best makeup 2025 reddit", "holy grail beauty product reddit",
+            "favorite skincare reddit", "best foundation reddit",
+            "best blush reddit", "best serum reddit", "best moisturizer reddit",
+            "must have beauty product reddit", "best drugstore makeup reddit",
+            "HG makeup reddit",
         ]
 
         for query in search_queries:
             st.write(f"搜尋: {query}...")
-            data = try_json(session, "https://www.reddit.com/search.json", {"q": query, "sort": "top", "t": "month", "limit": 25})
-            if data is None:
-                data = try_json(session, "https://old.reddit.com/search.json", {"q": query, "sort": "top", "t": "month", "limit": 25})
-            if data is not None:
-                for item in data:
-                    d = item.get("data", {})
-                    combined = f"{d.get('title', '')} {d.get('selftext', '')}"
-                    mentions = extract_mentions(combined)
-                    if mentions:
-                        all_posts.append({
-                            "title": d.get("title", ""),
-                            "content": d.get("selftext", ""),
-                            "link": f"https://reddit.com{d.get('permalink', '')}",
-                            "score": d.get("score", 0),
-                            "comments": d.get("num_comments", 0),
-                            "subreddit": "search",
-                            "mentions": mentions,
-                        })
-                methods_used["json"] += 1
-            else:
-                rss_entries = try_rss(session, f"https://www.reddit.com/search/.rss?q={quote(query)}&sort=top&t=month")
-                if rss_entries:
-                    for e in rss_entries:
-                        mentions = extract_mentions(f"{e['title']} {e['content']}")
-                        if mentions:
-                            all_posts.append({
-                                "title": e["title"], "content": e["content"],
-                                "link": e["link"], "score": 0, "comments": 0,
-                                "subreddit": "search", "mentions": mentions,
-                            })
-                    methods_used["rss"] += 1
-                else:
-                    methods_used["none"] += 1
+            posts = fetch_google_reddit(session, query)
+            if not posts:
+                posts = fetch_ddg_reddit(session, query)
+            for p in posts:
+                combined = f"{p['title']} {p['content']}"
+                mentions = extract_mentions(combined)
+                if mentions:
+                    all_posts.append({**p, "subreddit": "search", "mentions": mentions})
             time.sleep(1.5)
 
         st.write("分析討論度中...")
@@ -246,7 +229,8 @@ def scrape_reddit():
                 if len(brand_stats[mention]["top_posts"]) < 3:
                     brand_stats[mention]["top_posts"].append(post)
 
-        status.update(label=f"爬取完成！（JSON:{methods_used['json']} RSS:{methods_used['rss']} HTML:{methods_used['html']}）", state="complete")
+        method_str = " ".join(f"{k}:{v}" for k, v in method_counts.items())
+        status.update(label=f"爬取完成！({method_str})", state="complete")
 
     sorted_products = sorted(brand_stats.values(), key=lambda x: x["total_engagement"], reverse=True)
     return sorted_products[:30], len(all_posts)
@@ -366,5 +350,5 @@ else:
     - r/BeautyGuruChatter、r/AsianBeauty
     - Reddit 全站美妝關鍵字搜尋
 
-    **多層爬取策略：** JSON API → RSS Feed → HTML 解析，自動嘗試直到成功
+    **多層爬取策略：** redlib 鏡像 → Google 搜尋 → DuckDuckGo 搜尋
     """)
